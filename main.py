@@ -61,6 +61,8 @@ parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='gloo', type=str,
                     help='distributed backend')
+parser.add_argument('--int8', action='store_true', help='int8 quantization')
+parser.add_argument('--profile', default='none', type=str, help='Profile')
 
 best_acc1 = 0
 
@@ -92,7 +94,8 @@ def main():
 
     val_loader = torch.utils.data.DataLoader(val_dataset,
         batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+        num_workers=args.workers, pin_memory=True,
+        sampler=torch.utils.data.RandomSampler(val_dataset, replacement=True, num_samples=1280))
 
     num_classes = len(val_dataset.classes)
     print('Total classes: ',num_classes)
@@ -100,22 +103,24 @@ def main():
     # create model
     print("=> creating model '{}'".format(args.arch))
     if args.arch == 'peleenet':
-        model = PeleeNet(num_classes=num_classes)          
+        model = PeleeNet(num_classes=num_classes)
     else:
         print("=> unsupported model '{}'. creating PeleeNet by default.".format(args.arch))
         model = PeleeNet(num_classes=num_classes)
 
     if args.distributed:
-        model.cuda()
+        # model.cuda()
         # DistributedDataParallel will divide and allocate batch_size to all
         # available GPUs if device_ids are not set
         model = torch.nn.parallel.DistributedDataParallel(model)
-    else:
-        # DataParallel will divide and allocate batch_size to all available GPUs
-        model = torch.nn.DataParallel(model).cuda()
+    # else:
+    #     # DataParallel will divide and allocate batch_size to all available GPUs
+    #     # model = torch.nn.DataParallel(model).cuda()
+    #     model = torch.nn.DataParallel(model)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    # criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -142,12 +147,25 @@ def main():
                   .format(args.pretrained, checkpoint['epoch'], checkpoint['best_acc1']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
+        mode = model.to(torch.device('cpu'))
 
-    cudnn.benchmark = True
+    # cudnn.benchmark = True
 
 
     if args.evaluate:
-        validate(val_loader, model, criterion)
+        model.eval()
+        if args.int8:
+            print('Before fuse')
+            print(model)
+            model.fuse()
+            print('After fuse')
+            print(model)
+            model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+            print(model.qconfig)
+            torch.quantization.prepare(model, inplace=True)
+            validate(val_loader, model, criterion)
+            torch.quantization.convert(model, inplace=True)
+        validate(val_loader, model, criterion, profile=args.profile)
         return
 
     # Training data loading
@@ -210,13 +228,13 @@ def train(train_loader, model, criterion, optimizer, epoch):
         ### Adjust learning rate
         lr = adjust_learning_rate(optimizer, epoch,  args.epochs, args.lr, iteration=i,
                                   iterations_per_epoch=len(train_loader),
-                                  method=args.lr_policy) 
+                                  method=args.lr_policy)
 
 
         # measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda(async=True)
+        # target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
 
@@ -251,46 +269,57 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
 
 
-def validate(val_loader, model, criterion):
+def validate(val_loader, model, criterion, profile='none'):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
     # switch to evaluate mode
-    model.eval()
 
-    end = time.time()
-    for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            # target = target.cuda(async=True)
+            # input_var = torch.autograd.Variable(input)
+            # target_var = torch.autograd.Variable(target)
 
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+            # compute output
+            end = time.time()
+            if profile != 'none':
+                with torch.autograd.profiler.profile() as prof:
+                    output = model(input)
+                if profile == 'stdio':
+                    print(prof)
+                else:
+                    if not os.path.exists('LOGS'):
+                        os.mkdir('LOGS')
+                    prof.export_chrome_trace('LOGS/'+profile+'.json')
+            else:
+                output = model(input)
 
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(acc1[0], input.size(0))
-        top5.update(acc5[0], input.size(0))
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            # end = time.time()
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            loss = criterion(output, target)
 
-        if i % args.print_freq == 0:
-            print('Test: [{0}/{1}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   i, len(val_loader), batch_time=batch_time, loss=losses,
-                   top1=top1, top5=top5))
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output.data, target, topk=(1, 5))
+            losses.update(loss.item(), input.size(0))
+            top1.update(acc1[0], input.size(0))
+            top5.update(acc5[0], input.size(0))
 
-    print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
+            # if i % args.print_freq == 0:
+            #     print('Test: [{0}/{1}]\t'
+            #           'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+            #           'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+            #           'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+            #           'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+            #            i, len(val_loader), batch_time=batch_time, loss=losses,
+            #            top1=top1, top5=top5))
+
+        print('Time {batch_time.avg:.3f} Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+                .format(batch_time=batch_time, top1=top1, top5=top5))
 
     return top1.avg
 
