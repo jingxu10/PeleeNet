@@ -289,7 +289,7 @@ def validate(val_loader, model, criterion, profile='none'):
                 with torch.autograd.profiler.profile() as prof:
                     output = model(input)
                 if profile == 'stdio':
-                    print(prof)
+                    print(prof.key_averages().table(sort_by="self_cpu_time_total"))
                 else:
                     if not os.path.exists('LOGS'):
                         os.mkdir('LOGS')
