@@ -139,8 +139,8 @@ def main():
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
     elif args.pretrained:
-        if os.path.isfile(args.pretrained):
-            checkpoint = torch.load(args.pretrained)
+        if os.path.isfile('checkpoint.pth.tar'):
+            checkpoint = torch.load('checkpoint.pth.tar', map_location=torch.device('cpu'))
             model.load_state_dict(checkpoint['state_dict'])
 
             print("=> loaded checkpoint '{}' (epoch {}, acc@1 {})"
@@ -155,16 +155,18 @@ def main():
     if args.evaluate:
         model.eval()
         if args.int8:
-            print('Before fuse')
-            print(model)
+            # print('Before fuse')
+            # print(model)
             model.fuse()
-            print('After fuse')
-            print(model)
+            # print('After fuse')
+            # print(model)
             model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-            print(model.qconfig)
+            # print(model.qconfig)
             torch.quantization.prepare(model, inplace=True)
+            print('validate for converting')
             validate(val_loader, model, criterion)
             torch.quantization.convert(model, inplace=True)
+        print('validate with int8')
         validate(val_loader, model, criterion, profile=args.profile)
         return
 
@@ -244,7 +246,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output.data, target, topk=(1, 5))
-        losses.update(loss.data[0], input.size(0))
+        losses.update(loss.item(), input.size(0))
         top1.update(acc1[0], input.size(0))
         top5.update(acc5[0], input.size(0))
 
