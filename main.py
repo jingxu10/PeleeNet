@@ -17,6 +17,9 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 from peleenet import PeleeNet
+from profiling import Profiling
+# from torch import itt
+import ilit
 
 model_names = [ 'peleenet']
 
@@ -152,22 +155,31 @@ def main():
     # cudnn.benchmark = True
 
 
-    if args.evaluate:
-        model.eval()
-        if args.int8:
-            # print('Before fuse')
-            # print(model)
-            model.fuse()
-            # print('After fuse')
-            # print(model)
-            model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
-            # print(model.qconfig)
-            torch.quantization.prepare(model, inplace=True)
-            print('validate for converting')
-            validate(val_loader, model, criterion)
-            torch.quantization.convert(model, inplace=True)
-        print('validate with int8')
-        validate(val_loader, model, criterion, profile=args.profile)
+    with Profiling(model, os.getpid(), enabled=False):
+        if args.evaluate:
+            model.eval()
+            if args.int8:
+                # print('Before fuse')
+                # print(model)
+                model.fuse()
+                # print('After fuse')
+                # print(model)
+                # model.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+                # # print(model.qconfig)
+                # torch.quantization.prepare(model, inplace=True)
+                # print('validate for converting')
+                # # itt.range_push('validate_convert')
+                # validate(val_loader, model, criterion)
+                # # itt.range_pop()
+                # # itt.range_push('quant_convert')
+                # torch.quantization.convert(model, inplace=True)
+                # # itt.range_pop()
+                tuner = ilit.Tuner('./config.yaml')
+                model = tuner.tune(model, val_loader, eval_dataloader=val_loader)
+            print('main validation')
+            # itt.range_push('main validation')
+            validate(val_loader, model, criterion, profile=args.profile)
+            # itt.range_pop()
         return
 
     # Training data loading
@@ -297,7 +309,14 @@ def validate(val_loader, model, criterion, profile='none'):
                         os.mkdir('LOGS')
                     prof.export_chrome_trace('LOGS/'+profile+'.json')
             else:
-                output = model(input)
+                num = 0
+                dur_sum = 0
+                for i in range(0, 20):
+                    t0 = time.time()
+                    output = model(input)
+                    if i >= 10:
+                        num += 1
+                        dur_sum += time.time() - t0
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -320,8 +339,9 @@ def validate(val_loader, model, criterion, profile='none'):
             #            i, len(val_loader), batch_time=batch_time, loss=losses,
             #            top1=top1, top5=top5))
 
-        print('Time {batch_time.avg:.3f} Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-                .format(batch_time=batch_time, top1=top1, top5=top5))
+        # print('Time {batch_time.avg:.3f} Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+        #         .format(batch_time=batch_time, top1=top1, top5=top5))
+        print('time: {:.3f}s, Acc1: {:.3f}, Acc5: {:.3f}'.format(dur_sum/num, top1.avg, top5.avg))
 
     return top1.avg
 
@@ -382,4 +402,5 @@ def accuracy(output, target, topk=(1,)):
 
 
 if __name__ == '__main__':
+    # with torch.autograd.profiler.emit_itt(enabled=True):
     main()
